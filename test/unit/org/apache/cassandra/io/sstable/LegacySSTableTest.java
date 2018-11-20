@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 
+import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -36,11 +37,20 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.SinglePartitionSliceCommandTest;
 import org.apache.cassandra.db.compaction.Verifier;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -50,6 +60,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.service.CacheService;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.streaming.StreamSession;
@@ -208,7 +219,137 @@ public class LegacySSTableTest
     }
 
     @Test
-    public void verifyOldSSTables() throws Exception
+    public void test14766() throws Exception
+    {
+        /*
+         * During upgrades from 2.1 to 3.0, reading from old sstables in reverse order could omit the very last row if the
+         * last indexed block had only two Unfiltered-s. See CASSANDRA-14766 for details.
+         *
+         * The sstable used here has two indexed blocks, with 2 cells/rows of ~500 bytes each, with column index interval of 1kb.
+         * Without the fix SELECT * returns 4 rows in ASC order, but only 3 rows in DESC order, omitting the last one.
+         */
+
+        QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_ka_14766 (pk int, ck int, value text, PRIMARY KEY (pk, ck));");
+        loadLegacyTable("legacy_%s_14766%s", "ka", "");
+
+        UntypedResultSet rs;
+
+        // read all rows in ASC order, expect all 4 to be returned
+        rs = QueryProcessor.executeInternal("SELECT * FROM legacy_tables.legacy_ka_14766 WHERE pk = 0 ORDER BY ck ASC;");
+        Assert.assertEquals(4, rs.size());
+
+        // read all rows in DESC order, expect all 4 to be returned
+        rs = QueryProcessor.executeInternal("SELECT * FROM legacy_tables.legacy_ka_14766 WHERE pk = 0 ORDER BY ck DESC;");
+        Assert.assertEquals(4, rs.size());
+    }
+
+    @Test
+    public void test14803() throws Exception
+    {
+        /*
+         * During upgrades from 2.1 to 3.0, reading from old sstables in reverse order could return early if the sstable
+         * reverse iterator encounters an indexed block that only covers a single row, and that row starts in the next
+         * indexed block.
+         */
+
+        QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_ka_14803 (k int, c int, v1 blob, v2 blob, PRIMARY KEY (k, c));");
+        loadLegacyTable("legacy_%s_14803%s", "ka", "");
+
+        UntypedResultSet forward = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.legacy_ka_14803 WHERE k=100"));
+        UntypedResultSet reverse = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.legacy_ka_14803 WHERE k=100 ORDER BY c DESC"));
+
+        logger.info("{} - {}", forward.size(), reverse.size());
+        Assert.assertFalse(forward.isEmpty());
+        Assert.assertEquals(forward.size(), reverse.size());
+    }
+
+    @Test
+    public void test14873() throws Exception
+    {
+        /*
+         * When reading 2.1 sstables in 3.0 in reverse order it's possible to wrongly return an empty result set if the
+         * partition being read has a static row, and the read is performed backwards.
+         */
+
+        /*
+         * Contents of the SSTable (column_index_size_in_kb: 1) below:
+         *
+         * insert into legacy_tables.legacy_ka_14873 (pkc, sc)     values (0, 0);
+         * insert into legacy_tables.legacy_ka_14873 (pkc, cc, rc) values (0, 5, '5555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555');
+         * insert into legacy_tables.legacy_ka_14873 (pkc, cc, rc) values (0, 4, '4444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444');
+         * insert into legacy_tables.legacy_ka_14873 (pkc, cc, rc) values (0, 3, '3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333');
+         * insert into legacy_tables.legacy_ka_14873 (pkc, cc, rc) values (0, 2, '2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222');
+         * insert into legacy_tables.legacy_ka_14873 (pkc, cc, rc) values (0, 1, '1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111');
+         */
+
+        String ddl =
+            "CREATE TABLE legacy_tables.legacy_ka_14873 ("
+            + "pkc int, cc int, sc int static, rc text, PRIMARY KEY (pkc, cc)"
+            + ") WITH CLUSTERING ORDER BY (cc DESC) AND compaction = {'enabled' : 'false', 'class' : 'LeveledCompactionStrategy'};";
+        QueryProcessor.executeInternal(ddl);
+        loadLegacyTable("legacy_%s_14873%s", "ka", "");
+
+        UntypedResultSet forward =
+            QueryProcessor.executeOnceInternal(
+                String.format("SELECT * FROM legacy_tables.legacy_ka_14873 WHERE pkc = 0 AND cc > 0 ORDER BY cc DESC;"));
+
+        UntypedResultSet reverse =
+            QueryProcessor.executeOnceInternal(
+                String.format("SELECT * FROM legacy_tables.legacy_ka_14873 WHERE pkc = 0 AND cc > 0 ORDER BY cc ASC;"));
+
+        Assert.assertEquals(5, forward.size());
+        Assert.assertEquals(5, reverse.size());
+    }
+
+    @Test
+    public void testMultiBlockRangeTombstones() throws Exception
+    {
+        /**
+         * During upgrades from 2.1 to 3.0, reading old sstables in reverse order would generate invalid sequences of
+         * range tombstone bounds if their range tombstones spanned multiple column index blocks. The read would fail
+         * in different ways depending on whether the 2.1 tables were produced by a flush or a compaction.
+         */
+
+        String version = "ka";
+        for (String tableFmt : new String[]{"legacy_%s_compacted_multi_block_rt%s", "legacy_%s_flushed_multi_block_rt%s"})
+        {
+            String table = String.format(tableFmt, version, "");
+            QueryProcessor.executeOnceInternal(String.format("CREATE TABLE legacy_tables.%s " +
+                                                             "(k int, c1 int, c2 int, v1 blob, v2 blob, " +
+                                                             "PRIMARY KEY (k, c1, c2))", table));
+            loadLegacyTable(tableFmt, version, "");
+
+            UntypedResultSet forward = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.%s WHERE k=100", table));
+            UntypedResultSet reverse = QueryProcessor.executeOnceInternal(String.format("SELECT * FROM legacy_tables.%s WHERE k=100 ORDER BY c1 DESC, c2 DESC", table));
+
+            Assert.assertFalse(forward.isEmpty());
+            Assert.assertEquals(table, forward.size(), reverse.size());
+        }
+    }
+
+    @Test
+    public void testInaccurateSSTableMinMax() throws Exception
+    {
+        QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_mc_inaccurate_min_max (k int, c1 int, c2 int, c3 int, v int, primary key (k, c1, c2, c3))");
+        loadLegacyTable("legacy_%s_inaccurate_min_max%s", "mc", "");
+
+        /*
+         sstable has the following mutations:
+            INSERT INTO legacy_tables.legacy_mc_inaccurate_min_max (k, c1, c2, c3, v) VALUES (100, 4, 4, 4, 4)
+            DELETE FROM legacy_tables.legacy_mc_inaccurate_min_max WHERE k=100 AND c1<3
+         */
+
+        String query = "SELECT * FROM legacy_tables.legacy_mc_inaccurate_min_max WHERE k=100 AND c1=1 AND c2=1";
+        List<Unfiltered> unfiltereds = SinglePartitionSliceCommandTest.getUnfilteredsFromSinglePartition(query);
+        Assert.assertEquals(2, unfiltereds.size());
+        Assert.assertTrue(unfiltereds.get(0).isRangeTombstoneMarker());
+        Assert.assertTrue(((RangeTombstoneMarker) unfiltereds.get(0)).isOpen(false));
+        Assert.assertTrue(unfiltereds.get(1).isRangeTombstoneMarker());
+        Assert.assertTrue(((RangeTombstoneMarker) unfiltereds.get(1)).isClose(false));
+    }
+
+    @Test
+    public void testVerifyOldSSTables() throws Exception
     {
         for (String legacyVersion : legacyVersions)
         {
@@ -498,7 +639,7 @@ public class LegacySSTableTest
         }
     }
 
-    private void copySstablesFromTestData(String table, File ksDir) throws IOException
+    public static void copySstablesFromTestData(String table, File ksDir) throws IOException
     {
         File cfDir = new File(ksDir, table);
         cfDir.mkdir();

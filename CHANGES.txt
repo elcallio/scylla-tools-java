@@ -1,3 +1,28 @@
+3.11.4
+ * Correct sstable sorting for garbagecollect and levelled compaction (CASSANDRA-14870)
+Merged from 3.0:
+ * Fix missing rows when reading 2.1 SSTables with static columns in 3.0 (CASSANDRA-14873)
+ * Move TWCS message 'No compaction necessary for bucket size' to Trace level (CASSANDRA-14884)
+ * Sstable min/max metadata can cause data loss (CASSANDRA-14861)
+ * Dropped columns can cause reverse sstable iteration to return prematurely (CASSANDRA-14838)
+ * Legacy sstables with  multi block range tombstones create invalid bound sequences (CASSANDRA-14823)
+ * Expand range tombstone validation checks to multiple interim request stages (CASSANDRA-14824)
+ * Reverse order reads can return incomplete results (CASSANDRA-14803)
+ * Avoid calling iter.next() in a loop when notifying indexers about range tombstones (CASSANDRA-14794)
+ * Fix purging semi-expired RT boundaries in reversed iterators (CASSANDRA-14672)
+ * DESC order reads can fail to return the last Unfiltered in the partition (CASSANDRA-14766)
+ * Fix corrupted collection deletions for dropped columns in 3.0 <-> 2.{1,2} messages (CASSANDRA-14568)
+ * Fix corrupted static collection deletions in 3.0 <-> 2.{1,2} messages (CASSANDRA-14568)
+ * Handle failures in parallelAllSSTableOperation (cleanup/upgradesstables/etc) (CASSANDRA-14657)
+ * Improve TokenMetaData cache populating performance avoid long locking (CASSANDRA-14660)
+ * Fix static column order for SELECT * wildcard queries (CASSANDRA-14638)
+ * sstableloader should use discovered broadcast address to connect intra-cluster (CASSANDRA-14522)
+ * Fix reading columns with non-UTF names from schema (CASSANDRA-14468)
+ Merged from 2.2:
+ * Fix incorrect cqlsh results when selecting same columns multiple times (CASSANDRA-13262)
+ * Returns null instead of NaN or Infinity in JSON strings (CASSANDRA-14377)
+
+
 3.11.3
  * Validate supported column type with SASI analyzer (CASSANDRA-13669)
  * Remove BTree.Builder Recycler to reduce memory usage (CASSANDRA-13929)
@@ -18,6 +43,8 @@
  * RateBasedBackPressure unnecessarily invokes a lock on the Guava RateLimiter (CASSANDRA-14163)
  * Fix wildcard GROUP BY queries (CASSANDRA-14209)
 Merged from 3.0:
+ * Fix corrupted static collection deletions in 3.0 -> 2.{1,2} messages (CASSANDRA-14568)
+ * Fix potential IndexOutOfBoundsException with counters (CASSANDRA-14167)
  * Always close RT markers returned by ReadCommand#executeLocally() (CASSANDRA-14515)
  * Reverse order queries with range tombstones can cause data loss (CASSANDRA-14513)
  * Fix regression of lagging commitlog flush log message (CASSANDRA-14451)
@@ -36,7 +63,6 @@ Merged from 3.0:
  * Handle all exceptions when opening sstables (CASSANDRA-14202)
  * Handle incompletely written hint descriptors during startup (CASSANDRA-14080)
  * Handle repeat open bound from SRP in read repair (CASSANDRA-14330)
- * Use zero as default score in DynamicEndpointSnitch (CASSANDRA-14252)
  * Respect max hint window when hinting for LWT (CASSANDRA-14215)
  * Adding missing WriteType enum values to v3, v4, and v5 spec (CASSANDRA-13697)
  * Don't regenerate bloomfilter and summaries on startup (CASSANDRA-11163)
